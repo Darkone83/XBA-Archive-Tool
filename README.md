@@ -6,7 +6,7 @@
 
 A Windows WPF tool for creating, inspecting, and extracting `.xba` archives — a custom compressed archive format designed for deployment on original Xbox hardware via the [XbDiag](https://github.com/Team-Resurgent/XbDiag) diagnostic suite.
 
-Developed by **Team Resurgent** in collaboration with **Darkone83**.
+Developed by **Darkone83**.
 
 ---
 
