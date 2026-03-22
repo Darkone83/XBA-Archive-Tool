@@ -1,5 +1,5 @@
 <div align-center>
-  <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/xba.png" width=400> <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Darkone83.png" width=400>
+  <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/xba.png" width=250> <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Darkone83.png" width=400>
 </div>
 
 # XBA Archive Tool
