@@ -1,8 +1,12 @@
+<div align-center>
+  <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/xba.png" width=250> <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Darkone83.png" width=400>
+</div>
+
 # XBA Archive Tool
 
 A Windows WPF tool for creating, inspecting, and extracting `.xba` archives — a custom compressed archive format designed for deployment on original Xbox hardware via the [XbDiag](https://github.com/Team-Resurgent/XbDiag) diagnostic suite.
 
-Developed by **Team Resurgent** in collaboration with **Darkone83**.
+Developed by **Darkone83**.
 
 ---
 
