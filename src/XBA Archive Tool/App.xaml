@@ -1,0 +1,140 @@
+﻿<Application x:Class="XbaTool.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <!-- ── Colours ─────────────────────────────────────────────────── -->
+        <Color x:Key="ColBg">#FF12121E</Color>
+        <Color x:Key="ColBg2">#FF1E1E30</Color>
+        <Color x:Key="ColBg3">#FF2A2A42</Color>
+        <Color x:Key="ColBg4">#FF3A3A5C</Color>
+        <Color x:Key="ColAccent">#FF5555AA</Color>
+        <Color x:Key="ColAccentHot">#FF7777CC</Color>
+        <Color x:Key="ColFg">#FFD0D0E8</Color>
+        <Color x:Key="ColFgDim">#FF7777AA</Color>
+        <Color x:Key="ColDir">#FF8888FF</Color>
+        <Color x:Key="ColComp">#FF88FFAA</Color>
+        <Color x:Key="ColStore">#FFCCCCCC</Color>
+        <Color x:Key="ColFilter">#FFFFCC55</Color>
+        <Color x:Key="ColError">#FFFF6666</Color>
+        <Color x:Key="ColGreen">#FF44CC44</Color>
+
+        <SolidColorBrush x:Key="BrBg"       Color="{StaticResource ColBg}"/>
+        <SolidColorBrush x:Key="BrBg2"      Color="{StaticResource ColBg2}"/>
+        <SolidColorBrush x:Key="BrBg3"      Color="{StaticResource ColBg3}"/>
+        <SolidColorBrush x:Key="BrBg4"      Color="{StaticResource ColBg4}"/>
+        <SolidColorBrush x:Key="BrAccent"   Color="{StaticResource ColAccent}"/>
+        <SolidColorBrush x:Key="BrAccentHot" Color="{StaticResource ColAccentHot}"/>
+        <SolidColorBrush x:Key="BrFg"       Color="{StaticResource ColFg}"/>
+        <SolidColorBrush x:Key="BrFgDim"    Color="{StaticResource ColFgDim}"/>
+        <SolidColorBrush x:Key="BrDir"      Color="{StaticResource ColDir}"/>
+        <SolidColorBrush x:Key="BrComp"     Color="{StaticResource ColComp}"/>
+        <SolidColorBrush x:Key="BrStore"    Color="{StaticResource ColStore}"/>
+        <SolidColorBrush x:Key="BrFilter"   Color="{StaticResource ColFilter}"/>
+        <SolidColorBrush x:Key="BrError"    Color="{StaticResource ColError}"/>
+        <SolidColorBrush x:Key="BrGreen"    Color="{StaticResource ColGreen}"/>
+
+        <!-- ── Toolbar button style ────────────────────────────────────── -->
+        <Style x:Key="ToolBtn" TargetType="Button">
+            <Setter Property="Background"   Value="{StaticResource BrBg4}"/>
+            <Setter Property="Foreground"   Value="{StaticResource BrFg}"/>
+            <Setter Property="BorderBrush"  Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding"      Value="14,6"/>
+            <Setter Property="FontFamily"   Value="Segoe UI"/>
+            <Setter Property="FontSize"     Value="13"/>
+            <Setter Property="Cursor"       Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}"
+                                CornerRadius="3">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background"
+                                        Value="{StaticResource BrAccentHot}"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background"
+                                        Value="{StaticResource BrAccent}"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Bd" Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ── ListView style ─────────────────────────────────────────── -->
+        <Style x:Key="DarkListView" TargetType="ListView">
+            <Setter Property="Background"        Value="{StaticResource BrBg}"/>
+            <Setter Property="Foreground"        Value="{StaticResource BrFg}"/>
+            <Setter Property="BorderBrush"       Value="Transparent"/>
+            <Setter Property="BorderThickness"   Value="0"/>
+            <Setter Property="FontFamily"        Value="Consolas"/>
+            <Setter Property="FontSize"          Value="12"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Auto"/>
+        </Style>
+
+        <Style x:Key="DarkListViewItem" TargetType="ListViewItem">
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+            <Setter Property="Padding"  Value="2,1"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListViewItem">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <GridViewRowPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background"
+                                        Value="{StaticResource BrBg4}"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background"
+                                        Value="{StaticResource BrBg3}"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ── GridViewColumnHeader style ─────────────────────────────── -->
+        <Style TargetType="GridViewColumnHeader">
+            <Setter Property="Background"   Value="{StaticResource BrBg3}"/>
+            <Setter Property="Foreground"   Value="{StaticResource BrFgDim}"/>
+            <Setter Property="BorderBrush"  Value="{StaticResource BrBg2}"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+            <Setter Property="Padding"      Value="6,3"/>
+            <Setter Property="FontFamily"   Value="Segoe UI"/>
+            <Setter Property="FontSize"     Value="12"/>
+            <Setter Property="FontWeight"   Value="SemiBold"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        </Style>
+
+        <!-- ── ProgressBar style ──────────────────────────────────────── -->
+        <Style x:Key="DarkProgress" TargetType="ProgressBar">
+            <Setter Property="Background"   Value="{StaticResource BrBg3}"/>
+            <Setter Property="Foreground"   Value="{StaticResource BrAccent}"/>
+            <Setter Property="BorderBrush"  Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Height"       Value="6"/>
+        </Style>
+
+        <!-- ── ScrollBar style ────────────────────────────────────────── -->
+        <Style TargetType="ScrollBar">
+            <Setter Property="Background" Value="{StaticResource BrBg2}"/>
+        </Style>
+    </Application.Resources>
+</Application>
