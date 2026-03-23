@@ -29,7 +29,7 @@
 
         <!-- Subtitle -->
         <TextBlock Grid.Row="1"
-                   Text="v1.0  ·  Custom XBA Archive Format"
+                   Text="v1.0.1  ·  Custom XBA Archive Format"
                    Foreground="{StaticResource BrFgDim}"
                    FontFamily="Segoe UI"
                    FontSize="15"

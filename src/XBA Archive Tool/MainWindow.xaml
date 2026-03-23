@@ -3,13 +3,21 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:XbaTool"
         Title="XBA Archive Tool"
-        Width="1080" Height="640"
+        Width="917" Height="640"
         MinWidth="720" MinHeight="440"
         Background="{StaticResource BrBg}"
         WindowStyle="SingleBorderWindow"
         AllowDrop="True"
         Drop="Window_Drop"
         DragOver="Window_DragOver">
+
+    <Window.InputBindings>
+        <KeyBinding Key="F1" Command="{x:Static ApplicationCommands.Help}"/>
+    </Window.InputBindings>
+    <Window.CommandBindings>
+        <CommandBinding Command="{x:Static ApplicationCommands.Help}"
+                        Executed="HelpCommand_Executed"/>
+    </Window.CommandBindings>
 
     <Grid>
         <Grid.RowDefinitions>
@@ -29,14 +37,17 @@
                         Content="📂  Open"   Click="BtnOpen_Click"   Margin="1"/>
                 <Button Style="{StaticResource ToolBtn}"
                         Content="📦  Pack"   Click="BtnPack_Click"   Margin="1"/>
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="4,0">
-                    <RadioButton x:Name="RbV2" Content="V2" IsChecked="True"
-                                 Foreground="{StaticResource BrFg}"
-                                 VerticalAlignment="Center" Margin="2,0"/>
-                    <RadioButton x:Name="RbV1" Content="V1"
-                                 Foreground="{StaticResource BrFg}"
-                                 VerticalAlignment="Center" Margin="2,0"/>
-                </StackPanel>
+                <ComboBox x:Name="CbVersion"
+                          Style="{StaticResource DarkComboBox}"
+                          Width="58"
+                          SelectedIndex="0"
+                          VerticalAlignment="Center"
+                          Margin="4,0"
+                          ToolTip="Pack format version">
+                    <ComboBoxItem Content="V3"/>
+                    <ComboBoxItem Content="V2"/>
+                    <ComboBoxItem Content="V1"/>
+                </ComboBox>
                 <Button Style="{StaticResource ToolBtn}"
                         Content="📤  Unpack" Click="BtnUnpack_Click" Margin="1"
                         x:Name="BtnUnpack" IsEnabled="False"/>
@@ -45,6 +56,8 @@
                         x:Name="BtnTest"   IsEnabled="False"/>
                 <Separator Width="1" Background="{StaticResource BrBg2}"
                            Margin="4,4"/>
+                <Button Style="{StaticResource ToolBtn}"
+                        Content="?   Help"  Click="BtnHelp_Click"   Margin="1"/>
                 <Button Style="{StaticResource ToolBtn}"
                         Content="ℹ   About" Click="BtnAbout_Click"  Margin="1"/>
             </StackPanel>

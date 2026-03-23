@@ -30,20 +30,38 @@ namespace XbaTool
 
         public string Path => Entry.Path;
         public string TypeLabel => Entry.Type == EntryType.Directory
-            ? (Entry.IsV2 ? "DIR v2" : "DIR v1")
-            : (Entry.IsV2 ? "FILE v2" : "FILE v1");
+            ? (Entry.IsV3 ? "DIR v3" : Entry.IsV2 ? "DIR v2" : "DIR v1")
+            : (Entry.IsV3 ? "FILE v3" : Entry.IsV2 ? "FILE v2" : "FILE v1");
 
         // Filter / codec summary shown in the Filter column.
         // v1: reflects per-file codec flag.
         // v2: reflects x86 filter flag; block-level codecs shown via BlocksLabel.
-        public string FilterLabel => Entry.IsV2
-            ? (Entry.X86Filter ? "x86" : "")
-            : (Entry.X86Filter && Entry.UsesLzss ? "x86+lzss" :
-               Entry.X86Filter ? "x86+lz77" :
-               Entry.UsesLzss ? "lzss" : "lz77");
+        public string FilterLabel
+        {
+            get
+            {
+                if (Entry.IsV3)
+                    return Entry.V3FilterFlag switch
+                    {
+                        0x00 => "",
+                        0x01 => "x86",
+                        0x02 => "delta8",
+                        0x03 => "delta16",
+                        0x04 => "stereo16",
+                        0x05 => "delta32",
+                        0xFF => "solid",
+                        _ => $"0x{Entry.V3FilterFlag:X2}"
+                    };
+                if (Entry.IsV2)
+                    return Entry.X86Filter ? "x86" : "";
+                return Entry.X86Filter && Entry.UsesLzss ? "x86+lzss" :
+                       Entry.X86Filter ? "x86+lz77" :
+                       Entry.UsesLzss ? "lzss" : "lz77";
+            }
+        }
 
         // v2 only: shows block count (e.g. "4 blk").
-        public string BlocksLabel => Entry.IsV2 && Entry.Type == EntryType.File
+        public string BlocksLabel => (Entry.IsV2 || Entry.IsV3) && Entry.Type == EntryType.File
             ? $"{Entry.BlockCount} blk"
             : "";
 
@@ -188,6 +206,15 @@ namespace XbaTool
     {
         private string? _archivePath;
         private CancellationTokenSource? _cts;
+
+        // Returns the pack version selected in the ComboBox: 1, 2, or 3.
+        // CbVersion items are ordered V3 (index 0), V2 (index 1), V1 (index 2).
+        private int RbVersion => CbVersion.SelectedIndex switch
+        {
+            0 => 3,
+            2 => 1,
+            _ => 2
+        };
         private readonly ObservableCollection<EntryViewModel> _items = new();
 
         public MainWindow()
@@ -344,10 +371,16 @@ namespace XbaTool
             }
 
             _archivePath = path;
-            TxtPath.Text = path;
+
+            // ── Detect archive version and sync the pack ComboBox ─────────
+            int detectedVer = XbaCodec.GetArchiveVersion(path);
+            CbVersion.SelectedIndex = detectedVer switch { 3 => 0, 1 => 2, _ => 1 };
+            string verLabel = $"XBA v{detectedVer}";
+
+            TxtPath.Text = $"[{verLabel}]  {path}";
             PopulateList(entries);
             SetArchiveButtons(true);
-            SetStatus($"Opened: {System.IO.Path.GetFileName(path)}  —  {entries.Count} entries");
+            SetStatus($"Opened [{verLabel}]: {System.IO.Path.GetFileName(path)}  —  {entries.Count} entries");
 
             // ── Background integrity check (CRC decode of every block) ────
             int fileCount = entries.Count(e => e.Type == EntryType.File);
@@ -441,18 +474,26 @@ namespace XbaTool
             });
 
             var packDebug = new System.Collections.Generic.List<string>();
+            int brotliFileCount = 0, brotliBlockTotal = 0;
+            int zstdFileCount = 0, zstdBlockTotal = 0;
             var logRpt = new Progress<LogEntry>(l =>
             {
                 if (l.Kind == "debug")
                     packDebug.Add($"{l.FilePath}\n  original CRC: {l.ExpectedCrc:X8}" +
                                   $"  filtered CRC: {l.FilteredCrc:X8}");
+                else if (l.Kind == "file")
+                {
+                    if (l.BrotliBlocks > 0) { brotliFileCount++; brotliBlockTotal += l.BrotliBlocks; }
+                    if (l.ZstdBlocks > 0) { zstdFileCount++; zstdBlockTotal += l.ZstdBlocks; }
+                }
             });
 
             try
             {
-                bool useV1 = RbV1.IsChecked == true;
-                if (useV1)
+                if (RbVersion == 1)
                     await Task.Run(() => XbaCodec.PackV1(src, dst, progressRpt, logRpt, _cts.Token));
+                else if (RbVersion == 3)
+                    await Task.Run(() => XbaCodec.PackV3(src, dst, progressRpt, logRpt, _cts.Token));
                 else
                     await Task.Run(() => XbaCodec.Pack(src, dst, progressRpt, logRpt, _cts.Token));
                 sw.Stop();
@@ -467,9 +508,21 @@ namespace XbaTool
                 long inBytes = entries.Where(e => e.Type == EntryType.File).Sum(e => e.UncompSize);
                 long outBytes = new FileInfo(dst).Length;
                 double ratio = inBytes > 0 ? (double)outBytes / inBytes * 100 : 100;
-                string fmt = (RbV1.IsChecked == true) ? "V1" : "V2";
+                string fmt = RbVersion == 1 ? "V1" : RbVersion == 3 ? "V3" : "V2";
+                string codecInfo = "";
+                if (RbVersion == 3)
+                {
+                    var parts = new System.Collections.Generic.List<string>();
+                    if (brotliBlockTotal > 0)
+                        parts.Add($"Brotli: {brotliBlockTotal} blk");
+                    if (zstdBlockTotal > 0)
+                        parts.Add($"Zstd: {zstdBlockTotal} blk");
+                    codecInfo = parts.Count > 0
+                        ? "  |  " + string.Join("  ", parts)
+                        : "  |  Deflate only";
+                }
                 SetStatus($"Packed [{fmt}] in {sw.Elapsed.TotalSeconds:F1}s  |  " +
-                          $"{FmtSize(inBytes)} → {FmtSize(outBytes)}  [{ratio:F1}%]");
+                          $"{FmtSize(inBytes)} → {FmtSize(outBytes)}  [{ratio:F1}%]{codecInfo}");
 
                 if (packDebug.Count > 0)
                     MessageBox.Show(string.Join("\n\n", packDebug),
@@ -630,6 +683,16 @@ namespace XbaTool
         }
 
         // ── About ─────────────────────────────────────────────────────────
+
+        private void BtnHelp_Click(object sender, RoutedEventArgs e) => OpenHelp();
+
+        private void HelpCommand_Executed(object sender, System.Windows.Input.ExecutedRoutedEventArgs e) => OpenHelp();
+
+        private void OpenHelp()
+        {
+            var help = new HelpWindow { Owner = this };
+            help.Show();
+        }
 
         private void BtnAbout_Click(object sender, RoutedEventArgs e)
         {

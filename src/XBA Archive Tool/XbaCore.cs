@@ -1,4 +1,4 @@
-﻿// XbaCore.cs — XBA archive format engine  v2
+﻿// XbaCore.cs — XBA archive format engine  v3
 //
 // ============================================================================
 // XBA v1 format  (magic XBA\x01)
@@ -50,12 +50,49 @@
 //   Huffman block layout:
 //     code_lengths[256]  one byte per symbol; 0 = absent
 //     bitstream[...]     remainder, packed LSB-first
+//
+// ============================================================================
+// XBA v3 format  (magic XBA\x03)
+// ============================================================================
+//
+//   Header (16 bytes):
+//     magic[4]         "XBA\x03"
+//     entry_count[4]   uint32 LE  — file entries only (no dir entries)
+//     toc_offset[4]    uint32 LE  — byte offset of TOC from file start
+//     flags[4]         uint32 LE  — bit 0 = has_solid_blocks
+//
+//   Per entry (files only):
+//     filter_flag[1]   pre-filter (0x00=none 0x01=x86 0x02=delta8 0x03=delta16
+//                                  0x04=deltastereo16 0x05=delta32 0xFF=solid)
+//     path_len[1]      uint8
+//     path[N]          ASCII, backslash-separated, relative
+//     uncomp_size[4]   uint32 LE
+//     crc32[4]         uint32 LE  — CRC32 of final decoded+unfiltered data
+//     block_count[2]   uint16 LE
+//     blocks[]:
+//       block_flag[1]  0x00=stored 0x01=lz77 0x02=lzss 0x03=deflate 0x04=strided
+//                    strided payload: [stride(1)] + raw deflate of stride-split block
+//       comp_size[4]   uint32 LE
+//       data[comp_size]
+//
+//   TOC at toc_offset:
+//     entry_count[4]   uint32 LE  — must match header
+//     reserved[4]      uint32 LE  — write zero
+//     per entry [8 bytes]:
+//       data_offset[4] uint32 LE  — byte offset of entry from archive start
+//       path_crc[4]    uint32 LE  — CRC32 of path string
+//
+//   Pre-filters applied whole-file before blocking; reversed after reassembly.
+//   LZ ring buffer carries forward between blocks of same file (not reset).
+//   Deflate blocks use raw DEFLATE (RFC 1951), no zlib header/trailer.
 
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace XbaTool
 {
@@ -74,6 +111,10 @@ namespace XbaTool
         // v2 fields
         public int BlockCount { get; init; }
         public bool IsV2 { get; init; }
+        // v3 fields
+        public bool IsV3 { get; init; }
+        public byte V3FilterFlag { get; init; }
+
         public bool Stored => CompSize == UncompSize;
         public double Ratio => UncompSize > 0
                                      ? (double)CompSize / UncompSize * 100.0
@@ -98,7 +139,14 @@ namespace XbaTool
         public bool IsV2 { get; init; }
         public uint ActualCrc { get; init; }
         public uint ExpectedCrc { get; init; }
-        public uint FilteredCrc { get; init; }  // CRC of assembled bytes BEFORE x86 unfilter
+        public uint FilteredCrc { get; init; }
+        // V3 analysis diagnostics
+        public double RawEntropy { get; init; }
+        public double BestDeltaEntropy { get; init; }
+        public byte SelectedFilter { get; init; }
+        public bool ForcedStore { get; init; }
+        public int BrotliBlocks { get; init; }   // number of blocks compressed with Brotli
+        public int ZstdBlocks { get; init; }   // number of blocks compressed with Zstd
     }
 
     public sealed class TestResult
@@ -107,32 +155,9 @@ namespace XbaTool
         public int Errors { get; init; }
     }
 
-    public static class XbaCodec
+    public static partial class XbaCodec
     {
         // ── Format constants ─────────────────────────────────────────────────
-
-        private static readonly byte[] MagicV1 = { (byte)'X', (byte)'B', (byte)'A', 0x01 };
-        private static readonly byte[] MagicV2 = { (byte)'X', (byte)'B', (byte)'A', 0x02 };
-
-        // v1 file flags
-        private const byte V1FlagDir = 0x01;
-        private const byte V1FlagLz77 = 0x00;
-        private const byte V1FlagX86Lz = 0x02;
-        private const byte V1FlagLzss = 0x03;
-        private const byte V1FlagX86Ls = 0x04;
-
-        // v2 file flags
-        private const byte V2FlagDir = 0x01;
-        private const byte V2FlagFile = 0x00;
-        private const byte V2FlagX86 = 0x02;
-
-        // v2 block flags
-        private const byte BlkStored = 0x00;
-        private const byte BlkLz77 = 0x01;
-        private const byte BlkLzss = 0x02;
-        private const byte BlkRle = 0x03;
-        private const byte BlkLz77Huff = 0x04;
-        private const byte BlkLzssHuff = 0x05;
 
         // LZ77 parameters
         private const int LzWin = 16384;
@@ -154,6 +179,30 @@ namespace XbaTool
 
         // Huffman
         private const int HuffSyms = 256;
+
+        // incompressible magic signatures — force stored, skip compression
+        private static readonly byte[][] IncompressibleMagic = {
+            // General compressed/encoded formats
+            new byte[] { 0xFF, 0xD8, 0xFF },                    // JPEG
+            new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A }, // PNG
+            new byte[] { 0x4F, 0x67, 0x67, 0x53 },              // OGG
+            new byte[] { 0x1F, 0x8B },                          // GZIP
+            new byte[] { 0x50, 0x4B, 0x03, 0x04 },              // ZIP
+            new byte[] { 0x52, 0x61, 0x72, 0x21 },              // RAR
+            new byte[] { 0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C }, // 7-Zip
+            // Xbox-specific pre-compressed/pre-encoded containers
+            new byte[] { 0x58, 0x4D, 0x56, 0x48 },              // XMV  (Xbox Media Video)
+            new byte[] { 0x58, 0x50, 0x52, 0x00 },              // XPR0 (Xbox texture pack v0)
+            new byte[] { 0x58, 0x50, 0x52, 0x32 },              // XPR2 (Xbox texture pack v2)
+            new byte[] { 0x57, 0x42, 0x4E, 0x44 },              // WBND (XWB wave bank, big-endian)
+            new byte[] { 0x44, 0x4E, 0x42, 0x57 },              // DNBW (XWB wave bank, little-endian)
+            new byte[] { 0x53, 0x44, 0x42, 0x4B },              // SDBK (XSB sound bank)
+        };
+
+        // WAV audioFormat values whose bulk data is already compressed -- force stored.
+        // 0x0002 = MS ADPCM, 0x0011 = IMA ADPCM, 0xFFFE = WAVE_FORMAT_EXTENSIBLE
+        private static readonly HashSet<int> AdpcmWavFormats =
+            new() { 0x0002, 0x0011, 0xFFFE };
 
         private static readonly HashSet<string> X86Exts =
             new(StringComparer.OrdinalIgnoreCase)
@@ -826,319 +875,6 @@ namespace XbaTool
                 : DecompressLz77(lzBuf, blockUncompSize);
         }
 
-        // ── v1 decompress dispatcher ─────────────────────────────────────────
-
-        public static byte[] DecompressV1(byte flag, byte[] data, int uncompSize)
-        {
-            if (flag == V1FlagLzss || flag == V1FlagX86Ls)
-                return DecompressLzss(data, uncompSize);
-            return DecompressLz77(data, uncompSize);
-        }
-
-        // ── v2 block decompress dispatcher ───────────────────────────────────
-
-        private static byte[] DecompressBlock(byte blockFlag, byte[] data, int blockUncompSize)
-        {
-            return blockFlag switch
-            {
-                BlkStored => data,
-                BlkLz77 => DecompressLz77(data, blockUncompSize),
-                BlkLzss => DecompressLzss(data, blockUncompSize),
-                BlkRle => DecompressRle(data, blockUncompSize),
-                BlkLz77Huff => DecompressHuffThenLz(data, blockUncompSize, false),
-                BlkLzssHuff => DecompressHuffThenLz(data, blockUncompSize, true),
-                _ => throw new InvalidDataException($"Unknown block flag 0x{blockFlag:X2}")
-            };
-        }
-
-        // ── Best-of block compression ─────────────────────────────────────────
-        //
-        // Tries all six modes for a single block and returns the smallest
-        // result along with its flag.
-
-        private static (byte[] data, byte flag) BestBlock(byte[] block)
-        {
-            if (block.Length < StoreMin)
-                return (block, BlkStored);
-
-            byte[]? best = null;
-            byte bestFlag = BlkStored;
-
-            void Try(byte[] compressed, byte flag)
-            {
-                // CompressCore / CompressRle return the original array ref when
-                // incompressible, so check for reference equality.
-                if (ReferenceEquals(compressed, block)) return;
-                if (compressed.Length >= block.Length * CompLimit) return;
-
-                // Round-trip verify: if decompression doesn't reproduce the
-                // source block exactly, this codec has a bug for this input.
-                // Fall back to stored rather than bake corrupt data into the archive.
-                try
-                {
-                    var verify = DecompressBlock(flag, compressed, block.Length);
-                    if (verify.Length != block.Length) return;
-                    for (int vi = 0; vi < block.Length; vi++)
-                        if (verify[vi] != block[vi]) return;
-                }
-                catch { return; }
-
-                if (best == null || compressed.Length < best.Length)
-                { best = compressed; bestFlag = flag; }
-            }
-
-            byte[] lz77 = CompressLz77(block);
-            byte[] lzss = CompressLzss(block);
-            byte[] rle = CompressRle(block);
-
-            Try(lz77, BlkLz77);
-            Try(lzss, BlkLzss);
-            Try(rle, BlkRle);
-
-            // Huffman second-stage: only try on top of the best LZ result
-            // to avoid redundant work.
-            if (!ReferenceEquals(lz77, block))
-            {
-                byte[]? huff = CompressHuffman(lz77, block.Length);
-                if (huff != null) Try(huff, BlkLz77Huff);
-            }
-            if (!ReferenceEquals(lzss, block))
-            {
-                byte[]? huff = CompressHuffman(lzss, block.Length);
-                if (huff != null) Try(huff, BlkLzssHuff);
-            }
-
-            return best == null ? (block, BlkStored) : (best, bestFlag);
-        }
-
-        // ── Pack (v2) ────────────────────────────────────────────────────────
-
-        public static void Pack(
-            string srcDir, string outPath,
-            IProgress<ProgressReport>? progress = null,
-            IProgress<LogEntry>? log = null,
-            CancellationToken ct = default)
-        {
-            var entries = CollectEntries(srcDir);
-            int total = entries.Count;
-
-            using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write,
-                                          FileShare.None, 65536);
-            using var bw = new BinaryWriter(fs, Encoding.ASCII, leaveOpen: false);
-
-            bw.Write(MagicV2);
-            bw.Write(total);
-
-            for (int i = 0; i < total; i++)
-            {
-                ct.ThrowIfCancellationRequested();
-                var (rel, absPath, isDir) = entries[i];
-                var pb = Encoding.ASCII.GetBytes(rel.Length > 255 ? rel[..255] : rel);
-
-                if (isDir)
-                {
-                    bw.Write(V2FlagDir); bw.Write((byte)pb.Length); bw.Write(pb);
-                    log?.Report(new LogEntry { Kind = "dir", FilePath = rel, IsV2 = true });
-                }
-                else
-                {
-                    var raw = File.ReadAllBytes(absPath);
-                    uint crc = Crc32(raw);
-                    // x86 filter disabled for V2: the per-block boundary problem means the
-                    // extractor cannot perfectly reverse a whole-file filter pass. Since
-                    // p.xbe compresses at ~100% ratio anyway the filter buys nothing.
-                    bool applyX86 = false;
-                    byte fileFlag = V2FlagFile;
-                    var src_ = raw;
-
-                    // Sanity check: verify x86 filter roundtrips correctly
-                    if (applyX86)
-                    {
-                        var roundtrip = X86Unfilter(src_);
-                        uint rtCrc = Crc32(roundtrip);
-                        if (rtCrc != crc)
-                            throw new InvalidDataException(
-                                $"x86 filter roundtrip failed for {rel}: " +
-                                $"expected {crc:X8} got {rtCrc:X8}");
-                        // Log the filtered CRC so we can compare to assembled CRC on unpack
-                        uint filteredCrc = Crc32(src_);
-                        log?.Report(new LogEntry
-                        {
-                            Kind = "debug",
-                            FilePath = rel,
-                            ExpectedCrc = crc,
-                            FilteredCrc = filteredCrc
-                        });
-                    }
-
-                    // Split into blocks
-                    int numBlocks = Math.Max(1, (src_.Length + BlockSize - 1) / BlockSize);
-                    var blocks = new List<(byte[] data, byte flag)>(numBlocks);
-                    long totalComp = 0;
-
-                    for (int bi = 0; bi < numBlocks; bi++)
-                    {
-                        int off = bi * BlockSize;
-                        int blen = Math.Min(BlockSize, src_.Length - off);
-                        var blk = new byte[blen];
-                        Array.Copy(src_, off, blk, 0, blen);
-                        var (cdata, cflag) = BestBlock(blk);
-                        blocks.Add((cdata, cflag));
-                        totalComp += cdata.Length;
-
-                        if (rel.EndsWith("p.xbe"))
-                            System.Diagnostics.Debug.WriteLine(
-                                $"PACK p.xbe blk{bi:D3} flag={cflag} csize={cdata.Length}" +
-                                $" srcCrc={Crc32(blk, 0, blk.Length):X8}");
-                    }
-
-                    bw.Write(fileFlag);
-                    bw.Write((byte)pb.Length);
-                    bw.Write(pb);
-                    bw.Write(raw.Length);   // uncomp_size (original, pre-filter)
-                    bw.Write(crc);
-                    bw.Write((short)numBlocks);
-
-                    foreach (var (bdata, bflag) in blocks)
-                    {
-                        bw.Write(bflag);
-                        bw.Write(bdata.Length);
-                        bw.Write(bdata);
-                    }
-
-                    log?.Report(new LogEntry
-                    {
-                        Kind = "file",
-                        FilePath = rel,
-                        UncompSize = raw.Length,
-                        CompSize = totalComp,
-                        X86 = applyX86,
-                        IsV2 = true
-                    });
-                }
-                progress?.Report(new ProgressReport { Done = i + 1, Total = total, CurrentFile = rel });
-            }
-        }
-
-
-        // ── Pack (v1) ────────────────────────────────────────────────────────
-        //
-        // V1 format: one entry per file, LZ77 or LZSS or stored, no blocks.
-        // Files larger than the LZ window compress with LZSS (32KB window).
-        // x86 filter applied before compression for .xbe/.exe/.dll/.sys/.ocx.
-        // CRC32 is of the original pre-filter data.
-        // Compatible with the simple Xbox-side Extract_V1 path.
-
-        public static void PackV1(
-            string srcDir, string outPath,
-            IProgress<ProgressReport>? progress = null,
-            IProgress<LogEntry>? log = null,
-            CancellationToken ct = default)
-        {
-            var entries = CollectEntries(srcDir);
-            int total = entries.Count;
-
-            using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write,
-                                          FileShare.None, 65536);
-            using var bw = new BinaryWriter(fs, Encoding.ASCII, leaveOpen: false);
-
-            bw.Write(MagicV1);
-            bw.Write(total);
-
-            for (int i = 0; i < total; i++)
-            {
-                ct.ThrowIfCancellationRequested();
-                var (rel, absPath, isDir) = entries[i];
-                var pb = Encoding.ASCII.GetBytes(rel.Length > 255 ? rel[..255] : rel);
-
-                if (isDir)
-                {
-                    bw.Write(V1FlagDir);
-                    bw.Write((byte)pb.Length);
-                    bw.Write(pb);
-                    log?.Report(new LogEntry { Kind = "dir", FilePath = rel, IsV2 = false });
-                }
-                else
-                {
-                    var raw = File.ReadAllBytes(absPath);
-                    uint crc = Crc32(raw);
-                    bool applyX86 = X86Exts.Contains(System.IO.Path.GetExtension(rel));
-                    bool useLzss = raw.Length > LzWin;
-
-                    // V1 Xbox extractor buffers are capped at BlockSize (65536).
-                    // Files larger than BlockSize must be stored raw -- no filter, no compression.
-                    // x86 filter is only applied when we will actually compress the result.
-                    byte fileFlag;
-                    byte[] comp;
-                    bool stored;
-
-                    if (raw.Length > BlockSize)
-                    {
-                        // Too large for compressed path -- store raw, no filter
-                        stored = true;
-                        fileFlag = V1FlagLz77;   // stored flag (compSize==uncompSize signals stored)
-                        comp = raw;
-                    }
-                    else
-                    {
-                        // Try compression with optional x86 pre-filter
-                        var src_ = applyX86 ? X86Filter(raw) : raw;
-
-                        if (applyX86)
-                            fileFlag = useLzss ? V1FlagX86Ls : V1FlagX86Lz;
-                        else
-                            fileFlag = useLzss ? V1FlagLzss : V1FlagLz77;
-
-                        comp = useLzss ? CompressLzss(src_) : CompressLz77(src_);
-                        stored = false;
-
-                        if (ReferenceEquals(comp, src_) || comp.Length >= src_.Length * CompLimit
-                            || comp.Length > BlockSize)
-                        {
-                            stored = true;
-                        }
-                        else
-                        {
-                            try
-                            {
-                                var verify = DecompressV1(fileFlag, comp, src_.Length);
-                                for (int vi = 0; vi < src_.Length; vi++)
-                                    if (verify[vi] != src_[vi]) { stored = true; break; }
-                            }
-                            catch { stored = true; }
-                        }
-
-                        if (stored)
-                        {
-                            // Compression failed or not beneficial -- store raw (no filter)
-                            comp = raw;
-                            fileFlag = V1FlagLz77;
-                        }
-                    }
-
-                    bw.Write(fileFlag);
-                    bw.Write((byte)pb.Length);
-                    bw.Write(pb);
-                    bw.Write(raw.Length);   // uncomp_size always original raw length
-                    bw.Write(comp.Length);  // comp_size == raw.Length when stored
-                    bw.Write(crc);          // CRC always of raw (pre-filter) data
-                    bw.Write(comp);
-
-                    log?.Report(new LogEntry
-                    {
-                        Kind = "file",
-                        FilePath = rel,
-                        UncompSize = raw.Length,
-                        CompSize = comp.Length,
-                        X86 = applyX86,
-                        Lzss = useLzss && !stored,
-                        IsV2 = false
-                    });
-                }
-                progress?.Report(new ProgressReport { Done = i + 1, Total = total, CurrentFile = rel });
-            }
-        }
-
         // ── Unpack ───────────────────────────────────────────────────────────
 
         public static void Unpack(
@@ -1154,144 +890,22 @@ namespace XbaTool
                                           FileShare.Read, 65536);
             using var br = new BinaryReader(fs, Encoding.ASCII, leaveOpen: false);
 
-            bool isV2 = DetectVersion(br);
-            int ec = br.ReadInt32();
+            int ver = DetectVersionNum(br);
 
-            for (int i = 0; i < ec; i++)
+            if (ver == 3)
             {
-                ct.ThrowIfCancellationRequested();
-                byte flag = br.ReadByte();
-                int pl = br.ReadByte();
-                var rel = Encoding.ASCII.GetString(br.ReadBytes(pl));
-                var ap = System.IO.Path.Combine(destDir,
-                                rel.Replace('\\', System.IO.Path.DirectorySeparatorChar));
-
-                bool isDir = isV2 ? flag == V2FlagDir : flag == V1FlagDir;
-
-                if (isDir)
-                {
-                    Directory.CreateDirectory(ap);
-                    log?.Report(new LogEntry { Kind = "dir", FilePath = rel, IsV2 = isV2 });
-                }
-                else if (isV2)
-                {
-                    int usize = br.ReadInt32();
-                    uint crc = br.ReadUInt32();
-                    int blockCount = br.ReadInt16();
-                    var assembled = new byte[usize];
-                    int outOff = 0;
-
-                    var blockCrcs = new uint[blockCount];
-                    for (int bi = 0; bi < blockCount; bi++)
-                    {
-                        byte bflag = br.ReadByte();
-                        int csize = br.ReadInt32();
-                        var bdata = br.ReadBytes(csize);
-                        int blockUncomp = bi < blockCount - 1
-                            ? BlockSize
-                            : usize - (blockCount - 1) * BlockSize;
-
-                        var decoded = DecompressBlock(bflag, bdata, blockUncomp);
-                        Array.Copy(decoded, 0, assembled, outOff, decoded.Length);
-                        blockCrcs[bi] = Crc32(decoded, 0, decoded.Length);
-
-                        if (rel == "p.xbe")
-                            System.Diagnostics.Debug.WriteLine(
-                                $"UNPACK p.xbe blk{bi:D3} flag={bflag} csize={csize}" +
-                                $" decoded={decoded.Length} crc={blockCrcs[bi]:X8}");
-
-                        outOff += decoded.Length;
-                    }
-
-                    // Verify assembled matches expected filtered source
-                    uint preUnfilterCrc = Crc32(assembled);
-
-                    if (flag == V2FlagX86)
-                    {
-                        uint assembledCrc = Crc32(assembled);
-                        assembled = X86Unfilter(assembled);
-                        uint unfilterCrc = Crc32(assembled);
-                        if (unfilterCrc != crc)
-                        {
-                            log?.Report(new LogEntry
-                            {
-                                Kind = "error",
-                                FilePath = rel,
-                                UncompSize = usize,
-                                IsV2 = true,
-                                ActualCrc = unfilterCrc,
-                                ExpectedCrc = crc,
-                                FilteredCrc = assembledCrc
-                            });
-                            continue;
-                        }
-                    }
-                    else
-                    {
-                        uint gotCrc = Crc32(assembled);
-                        if (gotCrc != crc)
-                        {
-                            log?.Report(new LogEntry
-                            {
-                                Kind = "error",
-                                FilePath = rel,
-                                UncompSize = usize,
-                                IsV2 = true,
-                                ActualCrc = gotCrc,
-                                ExpectedCrc = crc
-                            });
-                            continue;
-                        }
-                    }
-
-                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ap)!);
-                    File.WriteAllBytes(ap, assembled);
-                    log?.Report(new LogEntry
-                    {
-                        Kind = "file",
-                        FilePath = rel,
-                        UncompSize = usize,
-                        X86 = flag == V2FlagX86,
-                        IsV2 = true
-                    });
-                }
-                else
-                {
-                    // v1 path
-                    int usize = br.ReadInt32();
-                    int csize = br.ReadInt32();
-                    uint crc = br.ReadUInt32();
-                    var raw = br.ReadBytes(csize);
-
-                    byte[] decoded = csize == usize ? raw : DecompressV1(flag, raw, usize);
-                    if (flag == V1FlagX86Lz || flag == V1FlagX86Ls)
-                        decoded = X86Unfilter(decoded);
-
-                    if (Crc32(decoded) != crc)
-                        log?.Report(new LogEntry
-                        {
-                            Kind = "error",
-                            FilePath = rel,
-                            UncompSize = usize,
-                            CompSize = csize
-                        });
-                    else
-                    {
-                        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(ap)!);
-                        File.WriteAllBytes(ap, decoded);
-                        log?.Report(new LogEntry
-                        {
-                            Kind = "file",
-                            FilePath = rel,
-                            UncompSize = usize,
-                            CompSize = csize,
-                            X86 = flag == V1FlagX86Lz || flag == V1FlagX86Ls,
-                            Lzss = flag == V1FlagLzss || flag == V1FlagX86Ls
-                        });
-                    }
-                }
-                progress?.Report(new ProgressReport { Done = i + 1, Total = ec, CurrentFile = rel });
+                UnpackV3(br, destDir, progress, log, ct);
+                return;
             }
+
+            if (ver == 1)
+            {
+                UnpackV1(br, destDir, progress, log, ct);
+                return;
+            }
+
+            // ver == 2
+            UnpackV2(br, destDir, progress, log, ct);
         }
 
         // ── List ─────────────────────────────────────────────────────────────
@@ -1302,72 +916,12 @@ namespace XbaTool
             using var fs = new FileStream(xbaPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var br = new BinaryReader(fs, Encoding.ASCII, leaveOpen: false);
 
-            bool isV2 = DetectVersion(br);
-            int ec = br.ReadInt32();
+            int ver = DetectVersionNum(br);
+            if (ver == 3) return ListV3(br);
+            if (ver == 1) { ListV1(br, result); return result; }
 
-            for (int i = 0; i < ec; i++)
-            {
-                byte flag = br.ReadByte();
-                int pl = br.ReadByte();
-                var rel = Encoding.ASCII.GetString(br.ReadBytes(pl));
-
-                bool isDir = isV2 ? flag == V2FlagDir : flag == V1FlagDir;
-
-                if (isDir)
-                {
-                    result.Add(new ArchiveEntry
-                    {
-                        Type = EntryType.Directory,
-                        Path = rel,
-                        IsV2 = isV2
-                    });
-                }
-                else if (isV2)
-                {
-                    int usize = br.ReadInt32();
-                    uint crc = br.ReadUInt32();
-                    int blockCount = br.ReadInt16();
-                    long totalComp = 0;
-
-                    for (int bi = 0; bi < blockCount; bi++)
-                    {
-                        br.ReadByte();              // block_flag
-                        int csize = br.ReadInt32();
-                        totalComp += csize;
-                        fs.Seek(csize, SeekOrigin.Current);
-                    }
-
-                    result.Add(new ArchiveEntry
-                    {
-                        Type = EntryType.File,
-                        Path = rel,
-                        UncompSize = usize,
-                        CompSize = totalComp,
-                        Crc32 = crc,
-                        X86Filter = flag == V2FlagX86,
-                        BlockCount = blockCount,
-                        IsV2 = true
-                    });
-                }
-                else
-                {
-                    int usize = br.ReadInt32();
-                    int csize = br.ReadInt32();
-                    uint crc = br.ReadUInt32();
-                    fs.Seek(csize, SeekOrigin.Current);
-                    result.Add(new ArchiveEntry
-                    {
-                        Type = EntryType.File,
-                        Path = rel,
-                        UncompSize = usize,
-                        CompSize = csize,
-                        Crc32 = crc,
-                        X86Filter = flag == V1FlagX86Lz || flag == V1FlagX86Ls,
-                        UsesLzss = flag == V1FlagLzss || flag == V1FlagX86Ls,
-                        IsV2 = false
-                    });
-                }
-            }
+            // ver == 2
+            ListV2(br, fs, result);
             return result;
         }
 
@@ -1382,84 +936,52 @@ namespace XbaTool
             using var fs = new FileStream(xbaPath, FileMode.Open, FileAccess.Read, FileShare.Read);
             using var br = new BinaryReader(fs, Encoding.ASCII, leaveOpen: false);
 
-            bool isV2 = DetectVersion(br);
-            int ec = br.ReadInt32();
-
-            for (int i = 0; i < ec; i++)
+            int ver = DetectVersionNum(br);
+            if (ver == 3) return TestV3(br, progress, ct);
+            if (ver == 1)
             {
-                ct.ThrowIfCancellationRequested();
-                byte flag = br.ReadByte();
-                int pl = br.ReadByte();
-                var rel = Encoding.ASCII.GetString(br.ReadBytes(pl));
-
-                bool isDir = isV2 ? flag == V2FlagDir : flag == V1FlagDir;
-
-                if (!isDir)
-                {
-                    if (isV2)
-                    {
-                        int usize = br.ReadInt32();
-                        uint crc = br.ReadUInt32();
-                        int blockCount = br.ReadInt16();
-                        var assembled = new byte[usize];
-                        int outOff = 0;
-                        bool blockErr = false;
-
-                        for (int bi = 0; bi < blockCount; bi++)
-                        {
-                            byte bflag = br.ReadByte();
-                            int csize = br.ReadInt32();
-                            var bdata = br.ReadBytes(csize);
-                            int blockUncomp = bi < blockCount - 1
-                                ? BlockSize
-                                : usize - (blockCount - 1) * BlockSize;
-                            try
-                            {
-                                var dec = DecompressBlock(bflag, bdata, blockUncomp);
-                                Array.Copy(dec, 0, assembled, outOff, dec.Length);
-                                outOff += dec.Length;
-                            }
-                            catch { blockErr = true; break; }
-                        }
-
-                        if (!blockErr && flag == V2FlagX86)
-                            assembled = X86Unfilter(assembled);
-
-                        if (!blockErr && Crc32(assembled) == crc) ok++; else errors++;
-                    }
-                    else
-                    {
-                        int usize = br.ReadInt32();
-                        int csize = br.ReadInt32();
-                        uint crc = br.ReadUInt32();
-                        var raw = br.ReadBytes(csize);
-                        byte[] dec = csize == usize ? raw : DecompressV1(flag, raw, usize);
-                        if (flag == V1FlagX86Lz || flag == V1FlagX86Ls)
-                            dec = X86Unfilter(dec);
-                        if (Crc32(dec) == crc) ok++; else errors++;
-                    }
-                }
-                progress?.Report(new ProgressReport { Done = i + 1, Total = ec, CurrentFile = rel });
+                TestV1(br, progress, ct, ref ok, ref errors);
+                return new TestResult { Ok = ok, Errors = errors };
             }
+
+            // ver == 2
+            TestV2(br, progress, ct, ref ok, ref errors);
             return new TestResult { Ok = ok, Errors = errors };
         }
 
-        // ── Helpers ──────────────────────────────────────────────────────────
+        // ── Public version probe ──────────────────────────────────────────
+        // Returns 1, 2, or 3.  Throws InvalidDataException on bad/missing magic.
+        public static int GetArchiveVersion(string xbaPath)
+        {
+            using var fs = new FileStream(xbaPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            using var br = new BinaryReader(fs, Encoding.ASCII, leaveOpen: false);
+            return DetectVersionNum(br);
+        }
 
-        // Reads the 4-byte magic and returns true for v2, false for v1.
-        // Throws InvalidDataException on unknown magic.
-        private static bool DetectVersion(BinaryReader br)
+        // Returns: 1=v1, 2=v2, 3=v3
+        private static int DetectVersionNum(BinaryReader br)
         {
             var m = br.ReadBytes(4);
             if (m.Length < 4)
                 throw new InvalidDataException("Not a valid XBA archive.");
+            if (m[0] == MagicV3[0] && m[1] == MagicV3[1] &&
+                m[2] == MagicV3[2] && m[3] == MagicV3[3])
+                return 3;
             if (m[0] == MagicV2[0] && m[1] == MagicV2[1] &&
                 m[2] == MagicV2[2] && m[3] == MagicV2[3])
-                return true;
+                return 2;
             if (m[0] == MagicV1[0] && m[1] == MagicV1[1] &&
                 m[2] == MagicV1[2] && m[3] == MagicV1[3])
-                return false;
+                return 1;
             throw new InvalidDataException("Not a valid XBA archive.");
+        }
+
+        // Legacy bool helper for V1/V2 code paths
+        private static bool DetectVersion(BinaryReader br)
+        {
+            int v = DetectVersionNum(br);
+            if (v == 3) throw new InvalidDataException("Use Unpack/List/Test for V3 archives.");
+            return v == 2;
         }
 
         private static List<(string rel, string abs, bool isDir)> CollectEntries(string srcDir)
@@ -1487,6 +1009,57 @@ namespace XbaTool
                 var rel = System.IO.Path.GetRelativePath(root, f).Replace('/', '\\');
                 result.Add((rel, f, false));
             }
+        }
+
+        // ── RunParallel helper ────────────────────────────────────────────────
+        // Runs work(i) for i in [0, count) on dedicated LongRunning threads,
+        // NOT the shared ThreadPool. This avoids the starvation deadlock that
+        // occurs when Parallel.For is called from inside Task.Run: both compete
+        // for the same pool, the outer Task.Run thread blocks waiting for inner
+        // work that can never start because the pool is full.
+        //
+        // Each thread is an OS thread created by TaskCreationOptions.LongRunning.
+        // We create at most (ProcessorCount - 1) threads and partition the work
+        // into that many chunks, each chunk processed sequentially on its thread.
+        internal static void RunParallel(int count, CancellationToken ct, Action<int> work)
+        {
+            if (count <= 0) return;
+
+            int threads = Math.Max(1, Math.Min(count, Environment.ProcessorCount - 1));
+            int chunkSize = (count + threads - 1) / threads;
+
+            var tasks = new System.Threading.Tasks.Task[threads];
+            Exception? firstEx = null;
+            object exLock = new object();
+
+            for (int t = 0; t < threads; t++)
+            {
+                int start = t * chunkSize;
+                int end = Math.Min(start + chunkSize, count);
+                if (start >= count) { tasks[t] = Task.CompletedTask; continue; }
+
+                tasks[t] = Task.Factory.StartNew(() =>
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        if (firstEx != null) break;
+                        try { work(i); }
+                        catch (Exception ex)
+                        {
+                            lock (exLock) { if (firstEx == null) firstEx = ex; }
+                        }
+                    }
+                },
+                ct,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
+            }
+
+            Task.WaitAll(tasks);
+
+            ct.ThrowIfCancellationRequested();
+            if (firstEx != null) ExceptionDispatchInfo.Capture(firstEx).Throw();
         }
     }
 }

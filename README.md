@@ -14,7 +14,7 @@ Developed by **Darkone83**.
 
 ## Features
 
-- Pack a directory tree into a V1 or V2 `.xba` archive
+- Pack a directory tree into a V1, V2, or V3 `.xba` archive
 - Unpack an archive to a destination directory
 - Inspect archive contents with per-entry type, codec, block count, size, ratio, and CRC32
 - Integrity-test an archive (full CRC verification without extracting to disk)
@@ -30,7 +30,7 @@ Developed by **Darkone83**.
 1. Click **Pack** (or drag a folder onto the window)
 2. Select the **source directory** to pack
 3. Choose the **output `.xba` filename**
-4. Select the archive version using the **V1 / V2 toggle** in the toolbar
+4. Select the archive version using the **V1 / V2 / V3 toggle** in the toolbar
 5. The tool packs, then immediately runs a full integrity test on the result
 
 ### Unpack
@@ -51,13 +51,13 @@ Opening an archive populates the file list with:
 | Column     | Description                                              |
 |------------|----------------------------------------------------------|
 | Name       | Relative path within the archive (backslash-separated)  |
-| Type       | `DIR v1`, `FILE v1`, `DIR v2`, or `FILE v2`             |
-| Filter     | `x86` if the x86 branch filter was applied (V1 only)    |
-| Blocks     | Number of compressed blocks (V2 files only)             |
+| Type       | `DIR v1`, `FILE v1`, `DIR v2`, `FILE v2`, or `FILE v3`  |
+| Filter     | Pre-compression filter applied to the file (V3)         |
+| Blocks     | Number of compressed blocks (V2 and V3 files)           |
 | Size       | Uncompressed file size                                   |
-| Compressed | Compressed size stored in the archive                   |
-| Ratio      | Compressed / uncompressed, or `stored` if no compression|
-| CRC32      | CRC32 of the original uncompressed data                 |
+| Compressed | Compressed size stored in the archive                    |
+| Ratio      | Compressed / uncompressed, or `stored` if no compression |
+| CRC32      | CRC32 of the original uncompressed data                  |
 
 ---
 
@@ -67,12 +67,13 @@ XBA uses a magic-versioned sequential container. All multi-byte integers are **l
 
 ### Magic bytes
 
-| Version | Magic (4 bytes hex) |
-|---------|---------------------|
+| Version | Magic (4 bytes hex)       |
+|---------|---------------------------|
 | V1      | `58 42 41 01` (`XBA\x01`) |
 | V2      | `58 42 41 02` (`XBA\x02`) |
+| V3      | `58 42 41 03` (`XBA\x03`) |
 
-### Common header
+### Common header (V1 / V2)
 
 ```
 [4]  magic         "XBA\x01" or "XBA\x02"
@@ -101,13 +102,13 @@ If flags != 0x01 (not a directory):
 
 #### V1 file flags
 
-| Value | Meaning                          |
-|-------|----------------------------------|
-| `0x00`| Plain file, LZ77 or stored       |
-| `0x01`| Directory entry                  |
-| `0x02`| x86-filtered file, LZ77          |
-| `0x03`| Plain file, LZSS                 |
-| `0x04`| x86-filtered file, LZSS          |
+| Value  | Meaning                        |
+|--------|--------------------------------|
+| `0x00` | Plain file, LZ77 or stored     |
+| `0x01` | Directory entry                |
+| `0x02` | x86-filtered file, LZ77        |
+| `0x03` | Plain file, LZSS               |
+| `0x04` | x86-filtered file, LZSS        |
 
 `comp_size == uncomp_size` signals a stored (uncompressed) entry regardless of the flags field.
 
@@ -170,11 +171,11 @@ If file_flag != 0x01 (not a directory):
 
 #### V2 file flags
 
-| Value  | Meaning                                        |
-|--------|------------------------------------------------|
-| `0x00` | Plain file, no filter                          |
-| `0x01` | Directory entry                                |
-| `0x02` | x86-filtered file *(reserved; see note below)*|
+| Value  | Meaning                                         |
+|--------|-------------------------------------------------|
+| `0x00` | Plain file, no filter                           |
+| `0x01` | Directory entry                                 |
+| `0x02` | x86-filtered file *(reserved; see note below)* |
 
 > **Note:** The x86 filter (`0x02`) is defined in the format but is **not emitted by the current packer**. Because the filter operates on the full file before blocking, reversing it correctly on a block-by-block basis at the extractor requires cross-block boundary handling that is not yet implemented. Packing with `file_flag = 0x02` will produce incorrect extraction results. The flag is reserved for a future version of the format.
 
@@ -208,9 +209,9 @@ Control byte per run, LSB interpretation:
 
 The block payload is structured as:
 ```
-[4]  lz_size         uint32 LE — byte count of the LZ-compressed intermediate
-[256] code_lengths   one byte per symbol 0–255; 0 = symbol absent from tree
-[...] bitstream      remainder of comp_size bytes, packed LSB-first
+[4]   lz_size       uint32 LE — byte count of the LZ-compressed intermediate
+[256] code_lengths  one byte per symbol 0–255; 0 = symbol absent from tree
+[...] bitstream     remainder of comp_size bytes, packed LSB-first
 ```
 
 1. The bitstream is Huffman-decoded using canonical codes rebuilt from `code_lengths`, producing `lz_size` bytes of LZ data.
@@ -225,41 +226,179 @@ Computed on the **final decoded data** (all blocks reassembled in order, after a
 
 ---
 
-## Compression Selection (V2 Packer)
+### V3 Format (`XBA\x03`)
 
-For each 65,536-byte block the packer tries all applicable codecs and selects the smallest result:
+V3 is the archival-grade format. It introduces a separated TOC, whole-file pre-filters, variable block sizes, and a full modern codec contest per block (Deflate, strided Deflate, Brotli, Zstd). Files-only — no directory entries in the data stream; directory hierarchy is encoded entirely in the path strings.
 
-1. Stored (baseline)
-2. LZ77
-3. LZSS
-4. RLE
-5. LZ77 + Huffman
-6. LZSS + Huffman
+#### Header
 
-A codec result is used only if it is smaller than `block_size × 0.98` (2% minimum improvement). Otherwise the block is stored.
+```
+[4]  magic          "XBA\x03"
+[4]  entry_count    uint32 LE  — number of file entries (no directory entries)
+[4]  toc_offset     uint32 LE  — byte offset of the TOC from start of file
+[4]  flags          uint32 LE  — archive-level flags (see below)
+```
+
+#### Archive-level flags
+
+| Bit | Meaning                   |
+|-----|---------------------------|
+| `0` | Solid blocks (reserved)   |
+
+#### Per-entry layout
+
+Entries are written sequentially after the header, each at the offset recorded in the TOC.
+
+```
+[1]  filter_flag    pre-compression filter applied to the whole file (see below)
+[1]  path_len       uint8
+[N]  path           ASCII path, path_len bytes
+[4]  uncomp_size    uint32 LE  — total uncompressed file size
+[4]  crc32          uint32 LE  — CRC32 of the final decoded + unfiltered data
+[2]  block_count    uint16 LE  — number of compressed blocks
+[4]  block_size     uint32 LE  — decompressed size of each non-last block
+
+Per block (block_count entries):
+  [1]  block_flag   codec used for this block (see below)
+  [4]  comp_size    uint32 LE  — compressed byte count for this block
+  [N]  data         comp_size bytes
+```
+
+The last block decompresses to `uncomp_size − (block_count − 1) × block_size` bytes. All other blocks decompress to exactly `block_size` bytes.
+
+#### V3 filter flags
+
+Applied to the **entire file** before blocking and compression. The reverse filter is applied after all blocks are decompressed and reassembled.
+
+| Value  | Filter                                          |
+|--------|-------------------------------------------------|
+| `0x00` | None                                            |
+| `0x01` | x86 branch filter (same algorithm as V1/V2)     |
+| `0x02` | Delta-8 (byte-level delta encoding)             |
+| `0x03` | Delta-16 (16-bit little-endian delta encoding)  |
+| `0x04` | Delta-32 (32-bit little-endian delta encoding)  |
+| `0x05` | Stereo delta (interleaved L/R channel delta)    |
+| `0xFF` | Solid block marker (reserved)                   |
+
+CRC32 is always computed on the **final decoded + unfiltered data**.
+
+#### V3 block flags
+
+| Value  | Codec                                      |
+|--------|--------------------------------------------|
+| `0x00` | Stored (no compression)                    |
+| `0x01` | LZ77                                       |
+| `0x02` | LZSS                                       |
+| `0x03` | Deflate (raw, no zlib/gzip framing)        |
+| `0x04` | Strided Deflate (stride-split + Deflate)   |
+| `0x05` | Brotli (quality 7, window 22)              |
+| `0x06` | Zstd (level 15, standard zstd frame)       |
+
+#### V3 block codec details
+
+**Stored (`0x00`):** Raw bytes, `comp_size == block_uncomp_size`.
+
+**LZ77 (`0x01`) / LZSS (`0x02`):** Same algorithms as V1/V2 above, applied per block.
+
+**Deflate (`0x03`):** Raw DEFLATE bitstream (RFC 1951), no zlib or gzip framing. Compressed with .NET `DeflateStream` at `SmallestSize`.
+
+**Strided Deflate (`0x04`):** Block payload is:
+```
+[1]  stride    uint8 — stride width in bytes (2, 4, or 8)
+[N]  data      raw DEFLATE of the stride-split block
+```
+The block bytes are de-interleaved by `stride` before compression (all bytes at offset `%2`, then `%4`, etc.), then Deflate-compressed. The decompressor inflates the data then re-interleaves to restore original byte order. Effective for structured numeric data (floats, vectors, PCM audio).
+
+**Brotli (`0x05`):** Raw Brotli-compressed bytes (RFC 7932). No additional framing — V3 already stores `comp_size` and `uncomp_size` per block. Compressed at quality 7, window size 22 (4 MB). Decompressed with `BrotliDecoder.TryDecompress`.
+
+**Zstd (`0x06`):** Standard zstd frame (RFC 8878), including magic number and frame header. Compressed at level 15. Decompressed with `ZstdSharp.Port` `Decompressor.Unwrap`.
+
+#### V3 block size
+
+Block size is chosen per file based on uncompressed file size:
+
+| File size     | Block size |
+|---------------|------------|
+| ≤ 2 MB        | 64 KB      |
+| > 2 MB        | 256 KB     |
+
+The chosen block size is stored in the `block_size` field of the entry header so the decompressor does not need to infer it.
+
+#### V3 TOC
+
+Written at `toc_offset` after all entry data:
+
+```
+[4]  entry_count   uint32 LE  — mirrors header entry_count
+[4]  reserved      uint32 LE  — zero
+Per entry (entry_count entries):
+  [4]  data_offset   uint32 LE  — byte offset of this entry from start of file
+  [4]  path_crc32    uint32 LE  — CRC32 of the ASCII path string
+```
+
+The TOC enables random access to any entry by path CRC without scanning the full data stream.
+
+#### V3 codec contest
+
+For every block the packer runs all codecs independently on the raw block bytes and keeps the smallest result. A codec result is used only if it is smaller than `block_size × 0.98` (2% minimum improvement threshold). Otherwise the block is stored. Already-incompressible content (detected by entropy analysis of the file header bytes) bypasses the contest entirely and is stored raw.
+
+#### V3 pre-filter selection
+
+Before blocking, the packer analyses the file and selects the filter most likely to improve compression:
+
+- Files with x86 branch density above threshold → x86 filter
+- Files with low raw entropy and strong delta improvement → delta filter (8, 16, or 32-bit, whichever gives best estimated gain)
+- Files with stereo PCM characteristics → stereo delta filter
+- Otherwise → no filter
+
+The packer compares estimated compressed sizes with and without the filter and only applies it if the filtered version is predicted to be smaller.
+
+#### V3 NuGet dependency
+
+V3 Zstd support requires the `ZstdSharp.Port` NuGet package:
+
+```xml
+<PackageReference Include="ZstdSharp.Port" Version="0.8.7" />
+```
+
+---
+
+## Compression Selection Summary
+
+| Version | Block size | Codecs available                                        |
+|---------|------------|---------------------------------------------------------|
+| V1      | Whole file (≤ 64 KB) | LZ77, LZSS (stored if > 64 KB)          |
+| V2      | 64 KB fixed | Stored, LZ77, LZSS, RLE, LZ77+Huffman, LZSS+Huffman  |
+| V3      | 64 KB / 256 KB (variable) | Stored, LZ77, LZSS, Deflate, Strided Deflate, Brotli, Zstd |
 
 ---
 
 ## Limitations
 
-| Limitation | Detail |
-|---|---|
-| Path length | Maximum 255 bytes per path entry |
-| Archive entries | No hard limit in the format; packer holds all entries in memory |
-| File size (V1) | Files compressing to > 65,536 bytes are stored uncompressed |
-| File size (V2) | No effective limit; files split into 65,536-byte blocks |
-| Compression (V1) | Single-pass; no multi-block or Huffman coding |
-| x86 filter (V2) | Not emitted by current packer; `file_flag = 0x02` is reserved |
-| Paths | ASCII only; no Unicode support |
-| Encoding | No encryption, no digital signatures |
-| Concurrency | Single-threaded packer; large archives may take time |
-| Xbox extractor | Static 65,536-byte buffers; V2 blocks > 65,536 bytes will fail |
+| Limitation        | Detail                                                                  |
+|-------------------|-------------------------------------------------------------------------|
+| Path length       | Maximum 255 bytes per path entry                                        |
+| Archive entries   | No hard limit in the format; packer holds entry metadata in memory      |
+| File size (V1)    | Files compressing to > 65,536 bytes are stored uncompressed             |
+| File size (V2/V3) | No effective limit; files split into fixed-size blocks                  |
+| Compression (V1)  | Single-pass; no multi-block or Huffman coding                           |
+| x86 filter (V2)   | Not emitted by current packer; `file_flag = 0x02` is reserved          |
+| V3 directories    | No directory entries in stream; hierarchy encoded in path strings only  |
+| Paths             | ASCII only; no Unicode support                                          |
+| Encoding          | No encryption, no digital signatures                                    |
+| Xbox extractor    | V3 Brotli/Zstd blocks require a future Xbox-side decoder implementation |
 
 ---
 
 ## Building
 
-The tool targets **.NET 8** with WPF. Open the solution in Visual Studio 2022 or later and build normally. No external NuGet dependencies.
+The tool targets **.NET 8** with WPF. Open the solution in Visual Studio 2022 or later and build normally.
+
+**NuGet dependencies:**
+
+| Package            | Version | Required for        |
+|--------------------|---------|---------------------|
+| `ZstdSharp.Port`   | 0.8.7   | V3 Zstd compression |
 
 ---
 
