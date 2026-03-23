@@ -1,7 +1,7 @@
 <div align-center>
   <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/xba.png" width=275> <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Darkone83.png" width=425>
 
-  <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Main.png">
+  <img src="https://github.com/Darkone83/XBA-Archive-Tool/blob/main/img/Main.png" width=700>
 </div>
 
 # XBA Archive Tool
