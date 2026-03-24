@@ -404,5 +404,5 @@ The tool targets **.NET 8** with WPF. Open the solution in Visual Studio 2022 or
 
 ## License
 
-Part of the [XbDiag](https://github.com/Team-Resurgent/XbDiag) project.  
+Part of the [XbDiag](https://github.com/Darkone83/XbDiag) project.  
 © Team Resurgent / Darkone83. See repository root for license details.
